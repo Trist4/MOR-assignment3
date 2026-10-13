@@ -38,10 +38,20 @@ ID, M0, TARGET = "cifwithcheckdigit", "m0_monthenddate", "target_value"
 
 
 # ----------------------------------------------------------------------------------------------
+def _decode(col):
+    """Dictionary-encoded (categorical) column -> plain strings. Other types are returned unchanged."""
+    return col.cast(col.type.value_type) if pa.types.is_dictionary(col.type) else col
+
+
+def _value_type(t):
+    return t.value_type if pa.types.is_dictionary(t) else t
+
+
 def customer_table(dataset):
     """One row per customer: row count, M0 month and target. Scans only 3 columns, aggregates in Arrow."""
     t = dataset.to_table(columns=[ID, M0, TARGET])
     g = t.group_by(ID).aggregate([(ID, "count"), (M0, "min"), (TARGET, "min")])
+    g = g.set_column(g.schema.get_field_index(ID), ID, _decode(g[ID]))      # ~120k keys only
     cust = g.to_pandas().rename(columns={f"{ID}_count": "n_rows", f"{M0}_min": "m0", f"{TARGET}_min": "target"})
     cust["month"] = pd.to_datetime(cust["m0"]).dt.to_period("M").astype(str)
     cust["stratum"] = cust["month"] + "|" + cust["target"].astype(str)
@@ -75,8 +85,9 @@ def draw_sample(cust, rows=None, customers=None, stratify=True, seed=42, tol=0.0
 
 
 def extract_rows(dataset, chosen):
-    ids = pa.array(chosen[ID].tolist(), type=dataset.schema.field(ID).type)
-    return dataset.to_table(filter=ds.field(ID).isin(ids))
+    ids = pa.array(chosen[ID].astype(str).tolist(), type=_value_type(dataset.schema.field(ID).type))
+    tbl = dataset.to_table(filter=ds.field(ID).isin(ids))
+    return tbl.set_column(tbl.schema.get_field_index(ID), ID, _decode(tbl[ID]))     # plain string ids from here on
 
 
 def check_complete(tbl, chosen):
