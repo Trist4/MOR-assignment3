@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tol", type=float, default=0.05, help="allowed relative deviation from --rows")
     ap.add_argument("--no-stratify", action="store_true", help="plain random sample instead of month x target strata")
-    ap.add_argument("--keep-ids", action="store_true", help="do NOT pseudonymise customer ids")
+    ap.add_argument("--keep-ids", action="store_false", help="pseudonymise customer ids")
     args, _ = ap.parse_known_args()
     if args.rows is None and args.customers is None:
         args.rows = 100_000
@@ -223,7 +223,7 @@ def main():
     print("\nRepresentativeness check:\n", summary.round(3).to_string())
     print("\nM0 month mix:\n", months.round(3).to_string())
 
-    if not args.keep_ids:
+    if args.keep_ids:
         tbl, mapping = pseudonymise(tbl, args.seed)
         map_path = os.path.splitext(args.out)[0] + "_id_map.csv"
         mapping.to_csv(map_path, index=False)

@@ -96,6 +96,10 @@ def build_clients(get_table, report):
     """One row per customer. Duplicates are removed by taking the DISTINCT customer-level records."""
     t = get_table(CLIENT_COLS)
     report["clients_raw_rows"] = t.num_rows
+
+    """
+    REMOVED FOR NOW BECAUSE DUPLICATES MAY NOT BE A DATA ISSUE
+
     try:
         distinct = t.group_by(CLIENT_COLS).aggregate([])
     except (pa.ArrowNotImplementedError, pa.ArrowInvalid):          # differing dictionaries across chunks
@@ -107,8 +111,10 @@ def build_clients(get_table, report):
     for c in (M0, PAY_DATE):
         clients[c] = _to_datetime(clients[c])
     report["clients_distinct_records"] = len(clients)
+    """
 
     # A customer should have exactly one distinct record; if not, keep the first and report it.
+    # There are multiple records due to transaction level data
     conflicts = clients[ID].duplicated(keep=False)
     report["clients_with_conflicting_records"] = int(clients.loc[conflicts, ID].nunique())
     clients = (clients.sort_values([ID, M0, PAY_DATE]).drop_duplicates(subset=ID, keep="first")
