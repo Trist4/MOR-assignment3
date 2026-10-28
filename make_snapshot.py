@@ -3,6 +3,7 @@ Create a random customer-level snapshot of a large transaction parquet file.
 
 Randomly selects customers and keeps ALL of their transaction rows (all observations), so every selected
 customer is complete. Observations with exclude_flag == 1 are dropped unless --keep-excluded is given.
+payment_date is repaired (it is stored truncated in the source, so it shows up near 1960) unless --no-date-fix.
 Memory-safe: only a few columns are scanned to build the customer list, then only the selected customers'
 rows are read.
 
@@ -38,6 +39,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 ID, OBS, M0, TARGET = "cifwithcheckdigit", "obs_id", "m0_monthenddate", "target_value"
+PAY, TXN_DATE, DFP = "payment_date", "transactiondate", "days_from_payment"
 EXCLUDE = ds.field("exclude_flag") == 0
 
 
@@ -119,6 +121,47 @@ def check_complete(tbl, chosen):
     assert len(got) == len(want), "snapshot contains customers that were not selected"
 
 
+def fix_payment_date(tbl, broken_before="2000-01-01", verbose=True):
+    """
+    Repair payment_date. In the source file it is a millisecond count from 1960-01-01 (SAS origin) that was
+    truncated to 32 bits, so every value lands within ~25 days of 1960-01-01. The lost high part is restored
+    by choosing the 2**32 ms cycle that puts the date closest to the middle of the m0 month.
+    Only values before `broken_before` are changed, so re-running on fixed data does nothing.
+    """
+    if PAY not in tbl.column_names:
+        return tbl
+    E, P, ms = pd.Timestamp("1960-01-01"), 2**32, pd.Timedelta(milliseconds=1)
+    pay = pd.to_datetime(pd.Series(tbl[PAY].to_pandas()))
+    m0 = pd.to_datetime(pd.Series(tbl[M0].to_pandas()))
+    broken = (pay < pd.Timestamp(broken_before)).to_numpy()
+    if not broken.any():
+        if verbose:
+            print("payment_date: no broken values found, left unchanged")
+        return tbl
+
+    low = ((pay[broken] - E) / ms).round().astype("int64").to_numpy()              # surviving 32-bit part
+    anchor = (((m0[broken] - pd.Timedelta(days=15)) - E) / ms).round().astype("int64").to_numpy()
+    k = np.round((anchor - low) / P).astype("int64")                                # lost cycles
+    fixed = pay.copy()
+    fixed[broken] = E + pd.to_timedelta(low + k * P, unit="ms")
+
+    arr = pa.array(fixed.to_numpy(dtype="datetime64[us]"), type=pa.timestamp("us"))
+    tbl = tbl.set_column(tbl.schema.get_field_index(PAY), PAY, arr)
+
+    if verbose:
+        print(f"\npayment_date: repaired {int(broken.sum()):,} of {len(pay):,} values; "
+              f"range {fixed.min()} to {fixed.max()}")
+        gap = (m0 - fixed).dt.days
+        print(f"  m0 minus payment_date (days): min {gap.min()}, median {gap.median():.0f}, max {gap.max()}")
+        if TXN_DATE in tbl.column_names and DFP in tbl.column_names:
+            txn = pd.to_datetime(pd.Series(tbl[TXN_DATE].to_pandas()))
+            dfp = pd.Series(tbl[DFP].to_pandas())
+            ok = txn.notna() & dfp.notna()
+            match = ((txn[ok].dt.normalize() - fixed[ok].dt.normalize()).dt.days == dfp[ok]).mean()
+            print(f"  check: transactiondate - payment_date == days_from_payment on {match:.1%} of rows")
+    return tbl
+
+
 def pseudonymise(tbl, col, prefix, seed):
     """Replace a column's values with random codes (prefix0000001...). Returns table and the map (keep private)."""
     data = _decode(tbl[col])
@@ -192,6 +235,7 @@ def main():
     ap.add_argument("--no-stratify", action="store_true", help="plain random sample instead of month x ever-bad strata")
     ap.add_argument("--keep-ids", action="store_true", help="do NOT pseudonymise customer and observation ids")
     ap.add_argument("--keep-excluded", action="store_true", help="keep observations with exclude_flag == 1")
+    ap.add_argument("--no-date-fix", action="store_true", help="leave payment_date exactly as in the source")
     args, _ = ap.parse_known_args()
     if args.rows is None and args.customers is None:
         args.customers = 5_000
@@ -221,6 +265,9 @@ def main():
     print("\nRepresentativeness check:\n", summary.round(3).to_string())
     print("\nFirst-M0 month mix:\n", months.round(3).to_string())
 
+    if not args.no_date_fix:
+        tbl = fix_payment_date(tbl)
+
     if not args.keep_ids:
         tbl, cmap = pseudonymise(tbl, ID, "C", args.seed)
         tbl, omap = pseudonymise(tbl, OBS, "O", args.seed + 1)
@@ -231,7 +278,8 @@ def main():
     write_snapshot(tbl, out_path)
     manifest = {"source": args.path, "seed": args.seed, "draw_attempt": attempt, "stratified": not args.no_stratify,
                 "customers": int(len(chosen)), "observations": int(chosen["n_obs"].sum()), "rows": int(tbl.num_rows),
-                "ids_pseudonymised": not args.keep_ids, "excluded_dropped": not args.keep_excluded}
+                "ids_pseudonymised": not args.keep_ids, "excluded_dropped": not args.keep_excluded,
+                "payment_date_fixed": not args.no_date_fix}
     with open(stem + "_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"Wrote {out_path} ({tbl.num_rows:,} rows, {os.path.getsize(out_path) / 1e6:,.1f} MB). "
