@@ -60,10 +60,13 @@ CSV_DTYPES = {ID: "string", "m0_arrearsamount": "float32", "due_count": "uint8",
 
 
 # ----------------------------------------------------------------------------------------------
+"""
+PUT INTO SEPARATE FEATURE ENGINEERING FILE
 def signed_log1p(x):
-    """sign(x) * log(1 + |x|): compresses heavy tails and is defined for zero and negative values.
-    For non-negative values it equals log1p(x)."""
+    sign(x) * log(1 + |x|): compresses heavy tails and is defined for zero and negative values.
+    For non-negative values it equals log1p(x).
     return np.sign(x) * np.log1p(np.abs(x))
+"""
 
 
 def _to_datetime(s):
@@ -189,9 +192,11 @@ def build_clients(get, key, client_cols, report, check_conflicts=False):
             clients[c] = _to_datetime(clients[c])
     clients = clients.sort_values(key).reset_index(drop=True)
 
+    """
     for c in MONEY_CLIENT:
         if c in clients:
             clients[f"{c}_slog"] = signed_log1p(clients[c].astype("float32")).astype("float32")
+    """
     if {"m0_arrearsamount", "m0_total_due_with_arrears"} <= set(clients.columns):
         clients["arrears_share_of_due"] = (clients["m0_arrearsamount"] /
                                            clients["m0_total_due_with_arrears"].replace(0, np.nan)).astype("float32")
@@ -243,9 +248,11 @@ def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_custom
         sub = sub.drop_duplicates(subset=dedupe_cols)                # key is included => within an observation only
         n_dup += n0 - len(sub)
 
+        """
         for c in MONEY_TXN:
             if c in sub:
                 sub[f"{c}_slog"] = signed_log1p(sub[c].astype("float32")).astype("float32")
+        """
         if m0_in_key and TXN_DATE in sub:                              # no obs_id: M0 is part of the key
             sub[M0] = _to_datetime(sub[M0])
             sub["days_before_m0"] = (sub[M0] - sub[TXN_DATE]).dt.days.astype("Int16")
