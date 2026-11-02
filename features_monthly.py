@@ -9,11 +9,9 @@ features_monthly.py - per-observation behavioural features built from the cleane
     feats = build_features(clients, txns)      # 2. one row per observation (obs_id = account x month)
 
 Unit of analysis: the OBSERVATION = obs_id (one credit-card account at one month; data owner's definition).
-KEY = (cifwithcheckdigit, obs_id). A customer can have several obs_ids in one month (several
-card accounts, or two statement dates in a month), and each of those is its own observation with its own features.
+KEY = obs_id. Each obs_id is its own observation with its own features.
 Features are grouped on obs_id, NOT on the customer. Splits for modelling should still be grouped by
 cifwithcheckdigit, because one customer's observations share behaviour (and often the same transactions).
-(Alternative key: set KEY_MODE = "cif_m0" below to collapse to one observation per customer-month.)
 Each row uses only that observation's own window.
 
 "Months": 30-day blocks counted back from the reference date (days_before_m0): m0 = latest (0-29 days before M0),
@@ -49,17 +47,7 @@ import numpy as np
 import pandas as pd
 
 ID, OBS, M0 = "cifwithcheckdigit", "obs_id", "m0_monthenddate"
-KEY_MODE = "obs_id"             # "obs_id": one observation per obs_id (account x month)  [data owner's definition]
-                                # "cif_m0": one per (customer, M0 month); several obs_ids in a month are collapsed
-KEY = [ID, OBS] if KEY_MODE == "obs_id" else [ID, M0]
-
-# Only used when KEY_MODE == "cif_m0": what to do when one customer has several obs_ids in the SAME M0 month:
-#   "keep_largest"  keep the one with the largest arrears amount (ties: highest obs_id)        [default]
-#   "drop_month"    drop every observation of that customer-month
-#   "drop_customer" drop the customer entirely (safest until the data owner explains the cases)
-#   "error"         stop with an error
-COLLISIONS = "keep_largest"
-COLLISION_SIZE_COL = "m0_arrearsamount"
+KEY = [OBS]
 TXN_TYPE, AMT, BAL, SPEND, CAT = "trantypedesc", "amount", "balance", "spendgroup", "categoryname"
 
 # ======================================================================================================
@@ -165,61 +153,24 @@ def signed_log1p(x):
 
 
 def resolve_observations(clients, collisions=None, verbose=True):
-    """
-    One row per observation. With KEY_MODE='obs_id' that is simply one row per obs_id. With KEY_MODE='cif_m0', when a customer has several obs_ids in the same month, keep one according
-    to `collisions` (default COLLISIONS). The returned table keeps the chosen obs_id as a plain column; it is what
-    links transactions to observations (attach_key).
-    """
-    collisions = collisions or COLLISIONS
+    """Validate and return one client row per obs_id."""
     c = clients.copy()
+    if OBS not in c:
+        raise KeyError(f"clients needs '{OBS}'")
+    if c[OBS].isna().any():
+        raise ValueError("clients contains missing obs_id values")
+    if c[OBS].duplicated().any():
+        raise ValueError("clients must contain exactly one row per obs_id")
     c[ID] = c[ID].astype(str)
-    if KEY_MODE == "obs_id":                            # the normal case: obs_id is the observation, nothing to resolve
-        if OBS not in c:
-            raise KeyError(f"clients needs '{OBS}' (or set KEY_MODE = 'cif_m0')")
-        if c.duplicated(KEY).any():
-            raise ValueError("clients has several rows per (customer, obs_id): clean_data should give one per observation")
-        return c.sort_values(KEY).reset_index(drop=True)
-    if OBS not in c:                                    # no obs_id in the data: (customer, M0) is already the key
-        if c.duplicated(KEY).any():
-            raise ValueError("clients has several rows per (customer, M0) and no obs_id to choose between them")
-        return c.sort_values(KEY).reset_index(drop=True)
-
-    dup = c.duplicated(KEY, keep=False)
-    n_obs, n_keys = int(dup.sum()), int(c.loc[dup, KEY].drop_duplicates().shape[0])
-    if n_obs:
-        if collisions == "error":
-            raise ValueError(f"{n_obs} observations share a (customer, M0) key ({n_keys} customer-months)")
-        if collisions == "keep_largest":
-            size = c[COLLISION_SIZE_COL].astype("float64").fillna(-np.inf) if COLLISION_SIZE_COL in c else 0.0
-            c = (c.assign(_size=size).sort_values(KEY + ["_size", OBS]).drop_duplicates(KEY, keep="last")
-                  .drop(columns="_size"))
-        elif collisions == "drop_month":
-            c = c[~dup]
-        elif collisions == "drop_customer":
-            c = c[~c[ID].isin(c.loc[dup, ID].unique())]
-        else:
-            raise ValueError("collisions must be keep_largest, drop_month, drop_customer or error")
-    if verbose and n_obs:
-        print(f"  key (customer, M0): {n_obs:,} observations in {n_keys:,} customer-months shared a key "
-              f"-> collisions='{collisions}' -> {len(c):,} observations kept")
-    return c.sort_values(KEY).reset_index(drop=True)
+    return c.sort_values(OBS).reset_index(drop=True)
 
 
 def attach_key(txns, chosen):
-    """
-    Keep only the transactions of the chosen observations and give them the observation key (customer, M0).
-    Needs `chosen` from resolve_observations. If txns has no obs_id but already carries M0, it is returned as is.
-    """
-    if KEY_MODE == "obs_id":
-        if OBS not in txns:
-            raise KeyError(f"txns needs '{OBS}'")
-        return txns
-    if OBS not in txns or OBS not in chosen:
-        if M0 in txns:
-            return txns
-        raise KeyError(f"txns needs '{OBS}' (or '{M0}') to be linked to observations")
-    m = chosen[[ID, OBS, M0]]
-    return txns.merge(m, on=[ID, OBS], how="inner")
+    """Transactions already carry obs_id; retain only observations present in clients."""
+    if OBS not in txns:
+        raise KeyError(f"txns needs '{OBS}'")
+    valid = chosen[OBS].drop_duplicates()
+    return txns.loc[txns[OBS].isin(valid)].copy()
 
 
 def _cat_flags(series, test):
@@ -263,7 +214,7 @@ def _group_ids(df, groups, default):
 
 
 def _empty(cols):
-    return pd.DataFrame(columns=cols, index=pd.MultiIndex.from_arrays([[], []], names=KEY), dtype="float64")
+    return pd.DataFrame(columns=cols, index=pd.Index([], name=OBS), dtype="float64")
 
 
 def monthly_wide(sub, mask, values, name, per_month=True):
@@ -310,7 +261,7 @@ def restrict_window(txns, chosen):
     sub = txns.loc[keep].copy()
     sub["month_idx"] = (age[keep] // MONTH_LEN).astype("int8")
     sub[ID] = sub[ID].astype(str)
-    return attach_key(sub, chosen)        # drops losers of key collisions, adds the M0 column of the key
+    return attach_key(sub, chosen)        # retain only known obs_id values
 
 
 def build_masks(sub):
@@ -346,7 +297,7 @@ def build_masks(sub):
 
 
 # ======================================================================================================
-# One function per feature group. Each returns a frame indexed by KEY (customer, obs_id).
+# One function per feature group. Each returns a frame indexed by obs_id.
 # ======================================================================================================
 def f_coverage(sub, M):
     """How much of the window actually has data (guards against reading missing history as zero spend)."""
@@ -431,7 +382,7 @@ def f_instalments_behind(clients):
     """
     c = clients.copy()
     c[ID] = c[ID].astype(str)
-    c = c.set_index(KEY)
+    c = c.set_index(OBS)
     arrears = c["m0_arrearsamount"].astype("float64")
     total_due = c["m0_total_due_with_arrears"].astype("float64")
     n_due = c["due_count"].astype("float64").replace(0, np.nan)
@@ -487,7 +438,7 @@ def add_ratios(feats):
 def txn_features(sub, chosen):
     sub = restrict_window(sub, chosen)
     if sub.empty:
-        return pd.DataFrame(index=pd.MultiIndex.from_arrays([[], []], names=KEY))
+        return pd.DataFrame(index=pd.Index([], name=OBS))
     M = build_masks(sub)
     parts = [f_coverage(sub, M), f_purchases(sub, M), f_monthly_spend(sub, M), f_group_outflow(sub, M),
              f_group_inflow(sub, M), f_income(sub, M), f_essentials(sub, M), f_nonessentials(sub, M),
@@ -495,16 +446,15 @@ def txn_features(sub, chosen):
     return pd.concat(parts, axis=1)
 
 
-def build_features(clients, txns, batch_customers=20_000, log_money=True, verbose=True, collisions=None):
+def build_features(clients, txns, batch_customers=20_000, log_money=True, verbose=True):
     """
-    Returns one row per observation (index = KEY = [customer, obs_id]).
-    collisions: only for KEY_MODE='cif_m0' (see COLLISIONS).
+    Returns one row per observation (index = obs_id).
     Memory-safe: transactions are processed in batches of whole customers.
     log_money: also add <col>_slog for money totals (sign(x) * log(1 + |x|)).
     """
     _validate_config()
-    clients = resolve_observations(clients, collisions, verbose)
-    idx = pd.MultiIndex.from_frame(clients[KEY])
+    clients = resolve_observations(clients)
+    idx = pd.Index(clients[OBS], name=OBS)
 
     codes = pd.factorize(txns[ID])[0]
     n_batches = max(1, int(np.ceil(clients[ID].nunique() / batch_customers)))
@@ -538,7 +488,7 @@ def build_features(clients, txns, batch_customers=20_000, log_money=True, verbos
 SEGMENT_COLS = ["m0_start_cd_group", "product_group", "new_to_arrears_flag"]   # use to stratify results and models
 
 
-def static_fields(clients, collisions=None):
+def static_fields(clients):
     """
     Point-in-time account fields known at M0, one row per observation (index = KEY), all numeric:
       arrears_share_of_due, crccreditlimit_slog, m0_arrearsamount_slog,
@@ -547,7 +497,7 @@ def static_fields(clients, collisions=None):
       dates in the month), one-hot product_group (NPDM lower risk, PDM medium, ACC high risk / low limit).
     Never includes outcome columns (payment_count, total_paid, target_rule, target_value).
     """
-    c = resolve_observations(clients, collisions, verbose=False).set_index(KEY)
+    c = resolve_observations(clients).set_index(OBS)
     out = pd.DataFrame(index=c.index)
     for col in ("arrears_share_of_due", "crccreditlimit_slog", "m0_arrearsamount_slog", "new_to_arrears_flag",
                 # "obs_in_month_for_cif" not in dataset yet

@@ -1,13 +1,13 @@
 """
 clean_data.py (v2, observation-aware) - read the collections data and return two cleaned tables.
 
-    clients : one row per OBSERVATION (customer + obs_id) - arrears / account information + log features
+    clients : one row per OBSERVATION (obs_id) - arrears / account information + log features
     txns    : one row per distinct transaction WITHIN an observation - plus log features and days_before_m0
 
 Why "observation"? The extract now carries obs_id / obs_seq, so one customer can appear in several observation
 windows, and the same transaction can legitimately appear in more than one of them (overlapping windows).
 Duplicates are therefore only removed WITHIN an observation, never across observations. If the file has no
-obs_id the key falls back to (customer, M0), which reproduces the earlier behaviour.
+obs_id the key falls back to (customer, M0) for legacy extracts.
 
 Which columns belong to which table is INFERRED from the data: a column that is constant within every sampled
 observation is observation-level (-> clients); one that varies is transaction-level (-> txns). New columns such as
@@ -286,7 +286,7 @@ def load_and_clean(path, batch_customers=10_000, id_as_category=True, verbose=Tr
     """
     Read `path` (.parquet or .csv) and return (clients, txns, report).
 
-    clients: one row per observation (customer + obs_id). Raw columns, `<money>_slog` log features,
+    clients: one row per observation (obs_id). Raw columns, `<money>_slog` log features,
              arrears_share_of_due, days_payment_before_m0.
     txns:    one row per distinct transaction within an observation. Raw columns, amount_slog, balance_slog,
              days_before_m0. Exact duplicates are removed within each observation only.
@@ -298,7 +298,7 @@ def load_and_clean(path, batch_customers=10_000, id_as_category=True, verbose=Tr
     t0 = time.time()
     report = {}
     names, get = _open(path)
-    key = [ID, OBS] if OBS in names else [ID, M0]
+    key = [OBS] if OBS in names else [ID, M0]
     report["key"] = key
 
     others = [c for c in names if c not in key]
