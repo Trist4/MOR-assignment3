@@ -1,30 +1,41 @@
 """
-feature_engineering.py - skeleton for per-observation behavioural features, built from the cleaned tables.
+feature_engineering_month_level.py - per-observation behavioural features built from the cleaned tables (v2: category GROUPS).
 
     from clean_data import load_and_clean
-    from feature_engineering import check_mappings, build_features
+    from feature_engineering_month_level import check_mappings, build_features
 
     clients, txns, report = load_and_clean("snapshot/snapshot.parquet")
-    check_mappings(txns)                       # 1. fill in / correct the category mappings first
-    feats = build_features(clients, txns)      # 2. one row per observation (customer + obs_id)
+    check_mappings(txns)                       # 1. review the mappings against your data
+    feats = build_features(clients, txns)      # 2. one row per observation (customer + M0 month)
 
-"Months": the window is cut into 30-day blocks counted back from the reference date (days_before_m0).
-    m0 = the latest block (0-29 days before M0), m1 = 30-59 days, m2 = 60-89 days. Change N_MONTHS / MONTH_LEN below.
+Unit of analysis: the OBSERVATION = one customer at one M0 month, KEY = (cifwithcheckdigit, m0_monthenddate).
+obs_id is NOT used as the key: a few customers have several obs_ids in the same month (different arrears amounts,
+same product), so obs_id is only used to pick which of them to keep (see COLLISIONS and resolve_observations).
+Each row uses only that observation's own window. Split train / test by cifwithcheckdigit.
 
-Requested feature                              -> columns produced
+"Months": 30-day blocks counted back from the reference date (days_before_m0): m0 = latest (0-29 days before M0),
+m1 = 30-59 days, m2 = 60-89 days. Change N_MONTHS / MONTH_LEN below.
+
+CATEGORY GROUPS. The ~100 category names are condensed into a few behavioural groups, and the mapping is
+DIRECTION-AWARE (OUTFLOW_GROUPS apply to money out, INFLOW_GROUPS to money in) because several categories mean
+different things in each direction (Child Support, Loans, Savings, Commission, Tax, Interest ...).
+Names not listed fall into 'unclassified' (out) / 'other_inflow' (in), so new categories never break anything.
+
+Feature -> columns
 -----------------------------------------------------------------------------------------------------------
-Number of purchases per person                 -> n_purchases_m0..m2, n_purchases_total
-Money spent per month                          -> spend_m0..m2, spend_total
-Change in spending trend                       -> spend_slope, spend_change_last_vs_prev   (income_* too)
-Money spent per category                       -> cat_spend_<category> (top K + other), cat_share_<category>
-Monthly income                                 -> income_m0..m2, income_total
-Money spent on essentials                      -> essentials_m0..m2, essentials_total, essentials_share_of_spend
-Money spent on non-essentials / gambling       -> nonessential_*, gambling_*, n_gambling_total, *_share_of_spend
-Money going into Live Better                   -> live_better_in_m0..m2, live_better_in_total
-Bank fees + penalties                          -> fees_*, n_fees_total, n_insufficient_fee_total, n_bounced_debits_total
-Amount of cash drawn                           -> cash_m0..m2, cash_total, n_cash_withdrawals_total
-Installments behind                             -> instalment_amount_est, instalments_behind_est
-UIF received => unemployed that month          -> uif_received_m*, unemployed_m0..m2, months_unemployed, unemployed_latest
+Purchases                       n_purchases_m0..m2, n_purchases_total
+Spend per month + trend         spend_m0..m2, spend_total, spend_slope, spend_change_last_vs_prev
+Spend per group (condensed)     grp_<group>_total, grp_<group>_share          (21 outflow groups)
+Inflow per group                in_<group>_total                              (9 inflow groups)
+Income + trend                  income_m0..m2, income_total, income_slope, income_change_last_vs_prev
+Essentials / non-essentials     essentials_*, nonessential_*, gambling_*, n_gambling_total (+ *_share_of_spend)
+Committed spend                 committed_share_of_spend
+Spread of spending              spend_group_entropy, n_spend_groups_used
+Live Better                     live_better_in_m0..m2, live_better_in_total, live_better_benefit_total
+Fees + penalties                fees_*, n_fees_total, n_insufficient_fee_total, n_bounced_debits_total
+Cash drawn                      cash_m0..m2, cash_total, n_cash_withdrawals_total
+Instalments behind              instalment_amount_est, instalments_behind_est
+UIF => unemployed that month    uif_received_m*, unemployed_m0..m2, months_unemployed, unemployed_latest
 
 Everything marked DRAFT / TODO is an assumption to confirm with the data owner.
 """
@@ -34,8 +45,17 @@ import re
 import numpy as np
 import pandas as pd
 
-ID, OBS = "cifwithcheckdigit", "obs_id"
-KEY = [ID, OBS]
+ID, OBS, M0 = "cifwithcheckdigit", "obs_id", "m0_monthenddate"
+KEY = [ID, M0]                  # observation key: customer + M0 month. obs_id is only a source column (see below)
+
+# What to do when one customer has several obs_ids in the SAME M0 month (the rows would otherwise overlap and
+# double count the same transactions):
+#   "keep_largest"  keep the one with the largest arrears amount (ties: highest obs_id)        [default]
+#   "drop_month"    drop every observation of that customer-month
+#   "drop_customer" drop the customer entirely (safest until the data owner explains the cases)
+#   "error"         stop with an error
+COLLISIONS = "keep_largest"
+COLLISION_SIZE_COL = "m0_arrearsamount"
 TXN_TYPE, AMT, BAL, SPEND, CAT = "trantypedesc", "amount", "balance", "spendgroup", "categoryname"
 
 # ======================================================================================================
@@ -44,17 +64,15 @@ TXN_TYPE, AMT, BAL, SPEND, CAT = "trantypedesc", "amount", "balance", "spendgrou
 MONTH_LEN = 30                  # days per "month" block
 N_MONTHS = 3                    # number of blocks (the extract holds ~98 days, so 3 x 30 is safe)
 AGE_COL = "days_before_m0"      # days from the transaction to the reference date (>= 0 = before it)
-TOP_K_CATEGORIES = 15           # categories that get their own cat_spend_* column; the rest go to "other"
 
-# tx_period looks like a pre / post flag. TODO: confirm what 'post' means. Rows that fall after the payment date
-# may already reflect the outcome, so only 'pre' rows are used. Set PRE_COL = None to switch the filter off.
+# tx_period looks like a pre / post flag. TODO: confirm what 'post' means. Rows after the payment date may already
+# reflect the outcome, so only 'pre' rows are used. Set PRE_COL = None to switch the filter off.
 PRE_COL, PRE_VALUE = "tx_period", "pre"
 
-# CardAuthorisationTransaction and CardTransaction have near-identical counts and amounts: probably each purchase
-# is recorded twice. TODO: confirm, then list the spend group to drop, e.g. ["CardAuthorisationTransaction"].
+# CardAuthorisationTransaction and CardTransaction look like the same purchases recorded twice.
+# TODO: confirm, then e.g. DROP_SPENDGROUPS = ["CardAuthorisationTransaction"].
 DROP_SPENDGROUPS = []
 
- 
 # ------------------------------------------------------------------------------------------------------
 # 1. CATEGORY -> GROUP MAPPINGS  (DRAFT: review with check_mappings() / mapping_table())
 # ------------------------------------------------------------------------------------------------------
@@ -91,7 +109,7 @@ OUTFLOW_GROUPS = {
     "transfers":          ["Transfer"],
     "unclassified":       ["Uncategorised"],                       # also receives every name not listed above
 }
- 
+
 # Money IN (amount > 0)
 INFLOW_GROUPS = {
     "income_employment":  ["Salary", "Wage", "Overtime", "Bonus", "Commission"],
@@ -105,7 +123,6 @@ INFLOW_GROUPS = {
     "transfers_in":       ["Transfer", "Automatic Savings"],
     "other_inflow":       ["Uncategorised", "Interest"],                                        # also the default
 }
- 
 
 # ------------------------------------------------------------------------------------------------------
 # 2. LENSES built from groups
@@ -119,7 +136,7 @@ COMMITTED_GROUPS = ["housing_utilities", "insurance", "debt_repayment", "communi
 INCOME_GROUPS = ["income_employment", "income_other"]          # "income" = employment + other recurring income
 NON_INCOME_SPENDGROUPS = ["UnpaidOrBouncedDebitOrder", "InternalTransfer"]   # reversals / own transfers are not income
 UIF_GROUP = "income_unemployment"                              # inflow here in a month => unemployed that month
- 
+
 # ------------------------------------------------------------------------------------------------------
 # 3. Other rules
 # ------------------------------------------------------------------------------------------------------
@@ -134,15 +151,63 @@ LIVE_BETTER_TRAN_REGEX = r"Live Better"                        # outflow leg = m
 LIVE_BETTER_BENEFIT_CATEGORIES = ["Live Better Benefit"]
 LIVE_BETTER_BENEFIT_SPENDGROUPS = ["LiveBetterBenefit"]
 PURCHASE_TRAN_REGEX = r"\bPurchase\b"                          # "Interest Charged for Purchases" does NOT match
- 
+
 
 # ======================================================================================================
 # Helpers
 # ======================================================================================================
 def signed_log1p(x):
     return np.sign(x) * np.log1p(np.abs(x))
- 
- 
+
+
+def resolve_observations(clients, collisions=None, verbose=True):
+    """
+    One row per (customer, M0 month). When a customer has several obs_ids in the same month, keep one according
+    to `collisions` (default COLLISIONS). The returned table keeps the chosen obs_id as a plain column; it is what
+    links transactions to observations (attach_key).
+    """
+    collisions = collisions or COLLISIONS
+    c = clients.copy()
+    c[ID] = c[ID].astype(str)
+    if OBS not in c:                                    # no obs_id in the data: (customer, M0) is already the key
+        if c.duplicated(KEY).any():
+            raise ValueError("clients has several rows per (customer, M0) and no obs_id to choose between them")
+        return c.sort_values(KEY).reset_index(drop=True)
+
+    dup = c.duplicated(KEY, keep=False)
+    n_obs, n_keys = int(dup.sum()), int(c.loc[dup, KEY].drop_duplicates().shape[0])
+    if n_obs:
+        if collisions == "error":
+            raise ValueError(f"{n_obs} observations share a (customer, M0) key ({n_keys} customer-months)")
+        if collisions == "keep_largest":
+            size = c[COLLISION_SIZE_COL].astype("float64").fillna(-np.inf) if COLLISION_SIZE_COL in c else 0.0
+            c = (c.assign(_size=size).sort_values(KEY + ["_size", OBS]).drop_duplicates(KEY, keep="last")
+                  .drop(columns="_size"))
+        elif collisions == "drop_month":
+            c = c[~dup]
+        elif collisions == "drop_customer":
+            c = c[~c[ID].isin(c.loc[dup, ID].unique())]
+        else:
+            raise ValueError("collisions must be keep_largest, drop_month, drop_customer or error")
+    if verbose and n_obs:
+        print(f"  key (customer, M0): {n_obs:,} observations in {n_keys:,} customer-months shared a key "
+              f"-> collisions='{collisions}' -> {len(c):,} observations kept")
+    return c.sort_values(KEY).reset_index(drop=True)
+
+
+def attach_key(txns, chosen):
+    """
+    Keep only the transactions of the chosen observations and give them the observation key (customer, M0).
+    Needs `chosen` from resolve_observations. If txns has no obs_id but already carries M0, it is returned as is.
+    """
+    if OBS not in txns or OBS not in chosen:
+        if M0 in txns:
+            return txns
+        raise KeyError(f"txns needs '{OBS}' (or '{M0}') to be linked to observations")
+    m = chosen[[ID, OBS, M0]]
+    return txns.merge(m, on=[ID, OBS], how="inner")
+
+
 def _cat_flags(series, test):
     """Evaluate `test` (Index -> bool array) once per category, then map to rows. Fast for categorical columns."""
     if isinstance(series.dtype, pd.CategoricalDtype):
@@ -152,20 +217,20 @@ def _cat_flags(series, test):
         codes = series.cat.codes.to_numpy()
         return np.where(codes >= 0, flag[np.clip(codes, 0, None)], False)
     return np.asarray(test(pd.Index(series.astype(str))), dtype=bool)
- 
- 
+
+
 def _isin(df, col, values):
     if col not in df or not values:
         return np.zeros(len(df), dtype=bool)
     return _cat_flags(df[col], lambda ix: ix.astype(str).isin([str(v) for v in values]))
- 
- 
+
+
 def _regex(df, col, pattern):
     if col not in df:
         return np.zeros(len(df), dtype=bool)
     return _cat_flags(df[col], lambda ix: ix.astype(str).str.contains(pattern, regex=True, na=False))
- 
- 
+
+
 def _group_ids(df, groups, default):
     """Group id (position in `groups`) for every row, from the category -> group lookup (once per category)."""
     names = list(groups)
@@ -181,12 +246,12 @@ def _group_ids(df, groups, default):
         codes = s.cat.codes.to_numpy()
         return np.where(codes >= 0, per_cat[np.clip(codes, 0, None)], unk).astype(np.int16)
     return s.astype(str).map(lut).fillna(unk).astype(np.int16).to_numpy()
- 
- 
+
+
 def _empty(cols):
     return pd.DataFrame(columns=cols, index=pd.MultiIndex.from_arrays([[], []], names=KEY), dtype="float64")
- 
- 
+
+
 def monthly_wide(sub, mask, values, name, per_month=True):
     """Sum `values` over rows in `mask`, per observation and month block. Columns: name_m0.. and name_total."""
     month_cols = [f"{name}_m{k}" for k in range(N_MONTHS)]
@@ -201,8 +266,8 @@ def monthly_wide(sub, mask, values, name, per_month=True):
     g.columns = month_cols
     g[total] = g.sum(axis=1)
     return g[cols]
- 
- 
+
+
 def _validate_config():
     """Catch typos: every group used by a lens or rule must exist."""
     bad = []
@@ -213,13 +278,12 @@ def _validate_config():
         bad += ["unclassified / other_inflow (default groups must exist)"]
     if bad:
         raise ValueError(f"Group names not defined in OUTFLOW_GROUPS / INFLOW_GROUPS: {sorted(set(bad))}")
- 
- 
+
 
 # ======================================================================================================
 # Window and masks
 # ======================================================================================================
-def restrict_window(txns):
+def restrict_window(txns, chosen):
     """Keep rows inside the look-back window (and 'pre' rows), add month_idx (0 = latest block)."""
     if AGE_COL not in txns:
         raise KeyError(f"'{AGE_COL}' missing: build txns with clean_data.load_and_clean first")
@@ -232,9 +296,9 @@ def restrict_window(txns):
     sub = txns.loc[keep].copy()
     sub["month_idx"] = (age[keep] // MONTH_LEN).astype("int8")
     sub[ID] = sub[ID].astype(str)
-    return sub
- 
- 
+    return attach_key(sub, chosen)        # drops losers of key collisions, adds the M0 column of the key
+
+
 def build_masks(sub):
     """Boolean row masks (numpy), split amounts and group ids, computed once per batch."""
     amt = sub[AMT].to_numpy("float64")
@@ -245,7 +309,7 @@ def build_masks(sub):
     og = lambda names: np.isin(out_g, [out_names.index(n) for n in names])
     ig = lambda names: np.isin(in_g, [in_names.index(n) for n in names])
     spd = lambda v: _isin(sub, SPEND, v)
- 
+
     spend = is_out & ~(og(NON_SPEND_GROUPS) | spd(NON_SPEND_SPENDGROUPS))
     fee = is_out & (og(FEE_GROUPS) | spd(FEE_SPENDGROUPS) | _regex(sub, TXN_TYPE, FEE_TRAN_REGEX))
     return {
@@ -265,27 +329,26 @@ def build_masks(sub):
         "income": is_in & ig(INCOME_GROUPS) & ~spd(NON_INCOME_SPENDGROUPS),
         "uif": is_in & ig([UIF_GROUP]),
     }
- 
 
 
 # ======================================================================================================
-# One function per feature group. Each returns a frame indexed by (customer, obs_id).
+# One function per feature group. Each returns a frame indexed by (customer, M0 month).
 # ======================================================================================================
 def f_coverage(sub, M):
     """How much of the window actually has data (guards against reading missing history as zero spend)."""
     g = sub.groupby(KEY, observed=True).agg(n_txn_window=("month_idx", "size"), n_months_with_txn=("month_idx", "nunique"))
     return g.astype("float64")
- 
- 
+
+
 def f_purchases(sub, M):
     return monthly_wide(sub, M["purchase"], np.ones(len(sub)), "n_purchases")
- 
- 
+
+
 def f_monthly_spend(sub, M):
     """Money spent per month (all outflows except savings / internal movements). Trends: add_trends()."""
     return monthly_wide(sub, M["spend"], M["out"], "spend")
- 
- 
+
+
 def _group_totals(sub, rows, group_ids, names, values, prefix):
     cols = [f"{prefix}{g}_total" for g in names]
     if not rows.any():
@@ -297,55 +360,55 @@ def _group_totals(sub, rows, group_ids, names, values, prefix):
            .reindex(columns=range(len(names))).fillna(0.0))
     g.columns = cols
     return g
- 
- 
+
+
 def f_group_outflow(sub, M):
     """Condensed 'money spent per category': one total per outflow group (includes savings / transfers)."""
     return _group_totals(sub, M["is_out"], M["out_g"], list(OUTFLOW_GROUPS), M["out"], "grp_")
- 
- 
+
+
 def f_group_inflow(sub, M):
     """One total per inflow group (income types, borrowing, savings drawdown, refunds ...)."""
     return _group_totals(sub, M["is_in"], M["in_g"], list(INFLOW_GROUPS), M["in"], "in_")
- 
- 
+
+
 def f_income(sub, M):
     """Monthly income = inflows in INCOME_GROUPS (reversed debit orders and internal transfers excluded)."""
     return monthly_wide(sub, M["income"], M["in"], "income")
- 
- 
+
+
 def f_essentials(sub, M):
     return monthly_wide(sub, M["essential"], M["out"], "essentials")
- 
- 
+
+
 def f_nonessentials(sub, M):
     """Non-essential spend (DISCRETIONARY_GROUPS) and gambling on its own (gambling is also inside non-essentials)."""
     return pd.concat([monthly_wide(sub, M["nonessential"], M["out"], "nonessential"),
                       monthly_wide(sub, M["gambling"], M["out"], "gambling"),
                       monthly_wide(sub, M["gambling"], np.ones(len(sub)), "n_gambling", per_month=False)], axis=1)
- 
- 
+
+
 def f_live_better(sub, M):
     return pd.concat([monthly_wide(sub, M["live_better_in"], M["out"], "live_better_in"),
                       monthly_wide(sub, M["live_better_benefit"], M["in"], "live_better_benefit", per_month=False)], axis=1)
- 
- 
+
+
 def f_fees(sub, M):
     return pd.concat([monthly_wide(sub, M["fee"], M["out"], "fees"),
                       monthly_wide(sub, M["fee"], np.ones(len(sub)), "n_fees", per_month=False),
                       monthly_wide(sub, M["insufficient_fee"], np.ones(len(sub)), "n_insufficient_fee", per_month=False),
                       monthly_wide(sub, M["bounced"], np.ones(len(sub)), "n_bounced_debits", per_month=False)], axis=1)
- 
- 
+
+
 def f_cash(sub, M):
     return pd.concat([monthly_wide(sub, M["cash"], M["out"], "cash"),
                       monthly_wide(sub, M["cash"], np.ones(len(sub)), "n_cash_withdrawals", per_month=False)], axis=1)
- 
- 
+
+
 def f_unemployment(sub, M):
     return monthly_wide(sub, M["uif"], M["in"], "uif_received")
- 
- 
+
+
 def f_instalments_behind(clients):
     """
     Instalments behind, estimated from information known AT M0 (never from payment_count / total_paid: those
@@ -372,8 +435,8 @@ def add_unemployment(feats):
     feats["months_unemployed"] = feats[[f"unemployed_m{k}" for k in range(N_MONTHS)]].sum(axis=1).astype("int8")
     feats["unemployed_latest"] = feats["unemployed_m0"]
     return feats
- 
- 
+
+
 def add_trends(feats, names=("spend", "income")):
     """OLS slope per month (oldest -> latest) and relative change latest vs previous month."""
     if N_MONTHS < 2:
@@ -386,8 +449,8 @@ def add_trends(feats, names=("spend", "income")):
         prev = A[:, 1]
         feats[f"{nm}_change_last_vs_prev"] = np.where(prev > 0, (A[:, 0] - prev) / np.where(prev > 0, prev, 1.0), np.nan)
     return feats
- 
- 
+
+
 def add_ratios(feats):
     """Shares of spend (scale-free: better for distance-based methods) and the condensed summary features."""
     sp = feats["spend_total"].where(feats["spend_total"] > 0)
@@ -402,12 +465,13 @@ def add_ratios(feats):
     feats["spend_group_entropy"] = (-(P * np.log(P.where(P > 0, 1.0))).sum(axis=1)).where(sp.notna())
     feats["n_spend_groups_used"] = (feats[gcols] > 0).sum(axis=1).astype("int8")
     return feats
- 
+
+
 # ======================================================================================================
 # Assembly
 # ======================================================================================================
-def txn_features(sub):
-    sub = restrict_window(sub)
+def txn_features(sub, chosen):
+    sub = restrict_window(sub, chosen)
     if sub.empty:
         return pd.DataFrame(index=pd.MultiIndex.from_arrays([[], []], names=KEY))
     M = build_masks(sub)
@@ -415,38 +479,38 @@ def txn_features(sub):
              f_group_inflow(sub, M), f_income(sub, M), f_essentials(sub, M), f_nonessentials(sub, M),
              f_live_better(sub, M), f_fees(sub, M), f_cash(sub, M), f_unemployment(sub, M)]
     return pd.concat(parts, axis=1)
- 
- 
-def build_features(clients, txns, batch_customers=20_000, log_money=True, verbose=True):
+
+
+def build_features(clients, txns, batch_customers=20_000, log_money=True, verbose=True, collisions=None):
     """
-    Returns one row per observation (index = [customer, obs_id]).
+    Returns one row per observation (index = [customer, m0_monthenddate]).
+    collisions: how to resolve several obs_ids in one customer-month (default COLLISIONS; see resolve_observations).
     Memory-safe: transactions are processed in batches of whole customers.
     log_money: also add <col>_slog for money totals (sign(x) * log(1 + |x|)).
     """
     _validate_config()
-    clients = clients.copy()
-    clients[ID] = clients[ID].astype(str)
+    clients = resolve_observations(clients, collisions, verbose)
     idx = pd.MultiIndex.from_frame(clients[KEY])
- 
+
     codes = pd.factorize(txns[ID])[0]
     n_batches = max(1, int(np.ceil(clients[ID].nunique() / batch_customers)))
     bid = codes % n_batches                                   # every customer lands wholly in one batch
     order = np.argsort(bid, kind="stable")
     bounds = np.searchsorted(bid[order], np.arange(n_batches + 1))
- 
+
     parts = []
     for b in range(n_batches):
-        parts.append(txn_features(txns.iloc[order[bounds[b]:bounds[b + 1]]]))
+        parts.append(txn_features(txns.iloc[order[bounds[b]:bounds[b + 1]]], clients))
         if verbose:
             print(f"  features batch {b + 1}/{n_batches} done")
     tf = pd.concat(parts) if parts else pd.DataFrame(index=idx)
- 
+
     feats = tf.reindex(idx).fillna(0.0)        # no in-window transactions => amounts and counts are 0
     feats = feats.join(f_instalments_behind(clients))
     feats = add_unemployment(feats)
     feats = add_trends(feats)
     feats = add_ratios(feats)
- 
+
     if log_money:
         money = [c for c in feats.columns if (c.endswith("_total") and not c.startswith("n_")) or c == "instalment_amount_est"]
         for c in money:
@@ -465,8 +529,8 @@ def mapping_table():
     return pd.DataFrame({"category": cats,
                          "outflow_group": [out_lut.get(c, "(default: unclassified)") for c in cats],
                          "inflow_group": [in_lut.get(c, "(default: other_inflow)") for c in cats]})
- 
- 
+
+
 def check_mappings(txns, top=25):
     """What the groups look like on your data, which categories are unmapped, and the pre/post window check."""
     _validate_config()
@@ -482,7 +546,7 @@ def check_mappings(txns, top=25):
     both = set(ESSENTIAL_GROUPS) & set(DISCRETIONARY_GROUPS)
     if both:
         print(f"WARNING: groups in both essential and discretionary: {sorted(both)}")
- 
+
     cats = txns[CAT]
     if isinstance(cats.dtype, pd.CategoricalDtype):
         codes, names = cats.cat.codes.to_numpy(), cats.cat.categories
@@ -499,14 +563,14 @@ def check_mappings(txns, top=25):
     in_lut = {str(c): g for g, cs in INFLOW_GROUPS.items() for c in cs}
     stats["outflow_group"] = [out_lut.get(c, "unclassified") for c in stats.index]
     stats["inflow_group"] = [in_lut.get(c, "other_inflow") for c in stats.index]
- 
+
     for label, col, lut in (("OUTFLOW", "outflow", out_lut), ("INFLOW", "inflow", in_lut)):
         g = stats.groupby(f"{col}_group")[col].agg(["sum"]).rename(columns={"sum": col})
         g["share_%"] = g[col] / g[col].sum() * 100
         g["n_categories"] = stats[stats[col] > 0].groupby(f"{col}_group").size()
         print(f"\n{label} groups on your data (share of total {col}):")
         print(g.sort_values(col, ascending=False).to_string(float_format=lambda v: f"{v:,.1f}"))
- 
+
     named = set(out_lut) | set(in_lut)
     unmapped = stats[~stats.index.isin(named)].assign(total=lambda d: d.outflow + d.inflow).sort_values("total", ascending=False)
     print(f"\nCategories in the data that no group names ({len(unmapped)}; they fall into unclassified / other_inflow):")
@@ -514,7 +578,7 @@ def check_mappings(txns, top=25):
     missing = sorted(named - set(stats.index))
     if missing:
         print(f"\nNamed in the config but absent from this data ({len(missing)}): {missing}")
- 
+
     print("\nWindow checks")
     if PRE_COL and PRE_COL in txns:
         print(f"{PRE_COL} counts: {txns[PRE_COL].value_counts().to_dict()}  (only '{PRE_VALUE}' rows are used)")
@@ -528,7 +592,7 @@ def check_mappings(txns, top=25):
                   " card spend may be double counted.")
     return unmapped
 
- 
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", default="snapshot/snapshot.parquet")
