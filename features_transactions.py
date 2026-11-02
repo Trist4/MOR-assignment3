@@ -1,12 +1,12 @@
 """
-feature_engineering_obs_level.py - RUNNING-STATE feature engineering (an alternative to the monthly blocks in features.py).
+features_transactions.py - RUNNING-STATE feature engineering (an alternative to the monthly blocks in features.py).
 
 Instead of cutting the window into 30-day months, every observation's transactions are replayed in time order and
 a running state is kept: "how much has come in / gone out so far", "what is my balance now", "how long since I was
 last paid". The state after the last transaction is the CURRENT state at M0 (or at any earlier cut-off: as_of).
 
     from clean_data import load_and_clean
-    from feature_engineering_obs_level import build_running_features, running_table, build_running_snapshots
+    from features_transactions import build_running_features, running_table, build_running_snapshots
 
     clients, txns, report = load_and_clean("snapshot/snapshot.parquet")
 
@@ -16,7 +16,7 @@ last paid". The state after the last transaction is the CURRENT state at M0 (or 
         ...                                                               # (batched generator: memory safe)
 
 Three outputs, three uses
-  build_running_features   one row per observation (cifwithcheckdigit, m0_monthenddate): the CURRENT state. Use for k-NN / SOM /
+  build_running_features   one row per observation (cifwithcheckdigit, obs_id): the CURRENT state. Use for k-NN / SOM /
                            trees, exactly like the monthly features.
   build_running_snapshots  the same state at several cut-offs, stacked long (extra index level as_of_days). Gives
                            time-awareness (state then vs now) without monthly buckets, and extra training rows.
@@ -44,14 +44,14 @@ import os
 import numpy as np
 import pandas as pd
 
-import feature_engineering_month_level as F
-from feature_engineering_month_level import (ID, OBS, M0, KEY, AMT, BAL, AGE_COL, OUTFLOW_GROUPS, INFLOW_GROUPS, NON_SPEND_GROUPS,
+import features_monthly as F
+from features_monthly import (ID, OBS, M0, KEY, AMT, BAL, AGE_COL, OUTFLOW_GROUPS, INFLOW_GROUPS, NON_SPEND_GROUPS,
                       COMMITTED_GROUPS, signed_log1p)
 
 # ======================================================================================================
 # CONFIG
 # ======================================================================================================
-WINDOW_DAYS = 92        # how far back from M0 the running state starts (snapshot shows 92 days before)
+WINDOW_DAYS = 92       # how far back from M0 the running state starts (the extract holds ~98 days)
 # Which categories / spendgroups count as income, essentials, fees ... is configured in features.py.
 
 SPEND_GROUPS = [g for g in OUTFLOW_GROUPS if g not in NON_SPEND_GROUPS]
@@ -75,8 +75,8 @@ def _window(txns, as_of, chosen):
     sub = txns.loc[keep].copy()
     sub[ID] = sub[ID].astype(str)
     sub["age"] = age[keep]
-    sub = F.attach_key(sub, chosen)          # drops losers of key collisions, adds the M0 column of the key
-    gid = pd.factorize(sub[ID] + "|" + sub[M0].astype(str))[0]
+    sub = F.attach_key(sub, chosen)          # no-op for KEY_MODE='obs_id'; collapses obs_ids for 'cif_m0'
+    gid = pd.factorize(sub[ID] + "|" + sub[KEY[1]].astype(str))[0]
     # newest = smallest days_before_m0, so sort age DESCENDING; ties keep the original file order
     order = np.lexsort((np.arange(len(sub)), -sub["age"].to_numpy(), gid))
     return sub.iloc[order].reset_index(drop=True), gid[order]
@@ -125,7 +125,7 @@ def _running(sub, gid, by_group=True):
     last_uif = pd.Series(np.where(M["uif"], age, np.nan)).groupby(gid).ffill().to_numpy()
     max_age = pd.Series(age).groupby(gid).transform("max").to_numpy()
 
-    out = pd.DataFrame({ID: sub[ID].to_numpy(), M0: sub[M0].to_numpy(), AGE_COL: age})
+    out = pd.DataFrame({ID: sub[ID].to_numpy(), KEY[1]: sub[KEY[1]].to_numpy(), AGE_COL: age})
     if "transactiondate" in sub:
         out["transactiondate"] = sub["transactiondate"].to_numpy()
     out = pd.concat([out, cum], axis=1)
@@ -199,7 +199,7 @@ def _batches(clients, txns, batch_customers):
 
 
 def _prep_clients(clients, collisions=None, verbose=True):
-    """One row per (customer, M0 month); several obs_ids in one month are resolved as in features.resolve_observations."""
+    """One row per observation (KEY = customer, obs_id; see features.KEY_MODE)."""
     clients = F.resolve_observations(clients, collisions, verbose)
     return clients, pd.MultiIndex.from_frame(clients[KEY])
 
@@ -235,7 +235,7 @@ def build_running_features(clients, txns, as_of=0, batch_customers=20_000, by_gr
 
 def build_running_snapshots(clients, txns, as_of=(60, 30, 0), **kw):
     """
-    The running state at several cut-offs, stacked long. Index = (customer, m0_monthenddate, as_of_days).
+    The running state at several cut-offs, stacked long. Index = (customer, obs_id, as_of_days).
     Compare state at 60 / 30 / 0 days before M0 to see direction without monthly buckets, or train on every cut-off
     (keep grouped-by-customer splits). Use a cut-off >= the embargo you need for honest early-warning tests.
     """
@@ -252,7 +252,7 @@ def build_running_snapshots(clients, txns, as_of=(60, 30, 0), **kw):
 def running_table(clients, txns, batch_customers=20_000, by_group=True, as_of=0, verbose=True, collisions=None):
     """
     GENERATOR of per-transaction running tables (one DataFrame per batch of whole customers).
-    Columns: customer, m0_monthenddate, days_before_m0, [transactiondate], run_* (state after this transaction), balance,
+    Columns: customer, obs_id, days_before_m0, [transactiondate], run_* (state after this transaction), balance,
     run_min/max_balance, days_since_last_income / uif (as at that transaction), days_covered.
     """
     F._validate_config()

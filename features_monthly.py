@@ -1,17 +1,20 @@
 """
-feature_engineering_month_level.py - per-observation behavioural features built from the cleaned tables (v2: category GROUPS).
+features_monthly.py - per-observation behavioural features built from the cleaned tables (v2: category GROUPS).
 
     from clean_data import load_and_clean
-    from feature_engineering_month_level import check_mappings, build_features
+    from features_monthly import check_mappings, build_features
 
     clients, txns, report = load_and_clean("snapshot/snapshot.parquet")
     check_mappings(txns)                       # 1. review the mappings against your data
-    feats = build_features(clients, txns)      # 2. one row per observation (customer + M0 month)
+    feats = build_features(clients, txns)      # 2. one row per observation (obs_id = account x month)
 
-Unit of analysis: the OBSERVATION = one customer at one M0 month, KEY = (cifwithcheckdigit, m0_monthenddate).
-obs_id is NOT used as the key: a few customers have several obs_ids in the same month (different arrears amounts,
-same product), so obs_id is only used to pick which of them to keep (see COLLISIONS and resolve_observations).
-Each row uses only that observation's own window. Split train / test by cifwithcheckdigit.
+Unit of analysis: the OBSERVATION = obs_id (one credit-card account at one month; data owner's definition).
+KEY = (cifwithcheckdigit, obs_id). A customer can have several obs_ids in one month (several
+card accounts, or two statement dates in a month), and each of those is its own observation with its own features.
+Features are grouped on obs_id, NOT on the customer. Splits for modelling should still be grouped by
+cifwithcheckdigit, because one customer's observations share behaviour (and often the same transactions).
+(Alternative key: set KEY_MODE = "cif_m0" below to collapse to one observation per customer-month.)
+Each row uses only that observation's own window.
 
 "Months": 30-day blocks counted back from the reference date (days_before_m0): m0 = latest (0-29 days before M0),
 m1 = 30-59 days, m2 = 60-89 days. Change N_MONTHS / MONTH_LEN below.
@@ -46,10 +49,11 @@ import numpy as np
 import pandas as pd
 
 ID, OBS, M0 = "cifwithcheckdigit", "obs_id", "m0_monthenddate"
-KEY = [ID, M0]                  # observation key: customer + M0 month. obs_id is only a source column (see below)
+KEY_MODE = "obs_id"             # "obs_id": one observation per obs_id (account x month)  [data owner's definition]
+                                # "cif_m0": one per (customer, M0 month); several obs_ids in a month are collapsed
+KEY = [ID, OBS] if KEY_MODE == "obs_id" else [ID, M0]
 
-# What to do when one customer has several obs_ids in the SAME M0 month (the rows would otherwise overlap and
-# double count the same transactions):
+# Only used when KEY_MODE == "cif_m0": what to do when one customer has several obs_ids in the SAME M0 month:
 #   "keep_largest"  keep the one with the largest arrears amount (ties: highest obs_id)        [default]
 #   "drop_month"    drop every observation of that customer-month
 #   "drop_customer" drop the customer entirely (safest until the data owner explains the cases)
@@ -162,13 +166,19 @@ def signed_log1p(x):
 
 def resolve_observations(clients, collisions=None, verbose=True):
     """
-    One row per (customer, M0 month). When a customer has several obs_ids in the same month, keep one according
+    One row per observation. With KEY_MODE='obs_id' that is simply one row per obs_id. With KEY_MODE='cif_m0', when a customer has several obs_ids in the same month, keep one according
     to `collisions` (default COLLISIONS). The returned table keeps the chosen obs_id as a plain column; it is what
     links transactions to observations (attach_key).
     """
     collisions = collisions or COLLISIONS
     c = clients.copy()
     c[ID] = c[ID].astype(str)
+    if KEY_MODE == "obs_id":                            # the normal case: obs_id is the observation, nothing to resolve
+        if OBS not in c:
+            raise KeyError(f"clients needs '{OBS}' (or set KEY_MODE = 'cif_m0')")
+        if c.duplicated(KEY).any():
+            raise ValueError("clients has several rows per (customer, obs_id): clean_data should give one per observation")
+        return c.sort_values(KEY).reset_index(drop=True)
     if OBS not in c:                                    # no obs_id in the data: (customer, M0) is already the key
         if c.duplicated(KEY).any():
             raise ValueError("clients has several rows per (customer, M0) and no obs_id to choose between them")
@@ -200,6 +210,10 @@ def attach_key(txns, chosen):
     Keep only the transactions of the chosen observations and give them the observation key (customer, M0).
     Needs `chosen` from resolve_observations. If txns has no obs_id but already carries M0, it is returned as is.
     """
+    if KEY_MODE == "obs_id":
+        if OBS not in txns:
+            raise KeyError(f"txns needs '{OBS}'")
+        return txns
     if OBS not in txns or OBS not in chosen:
         if M0 in txns:
             return txns
@@ -332,7 +346,7 @@ def build_masks(sub):
 
 
 # ======================================================================================================
-# One function per feature group. Each returns a frame indexed by (customer, M0 month).
+# One function per feature group. Each returns a frame indexed by KEY (customer, obs_id).
 # ======================================================================================================
 def f_coverage(sub, M):
     """How much of the window actually has data (guards against reading missing history as zero spend)."""
@@ -483,8 +497,8 @@ def txn_features(sub, chosen):
 
 def build_features(clients, txns, batch_customers=20_000, log_money=True, verbose=True, collisions=None):
     """
-    Returns one row per observation (index = [customer, m0_monthenddate]).
-    collisions: how to resolve several obs_ids in one customer-month (default COLLISIONS; see resolve_observations).
+    Returns one row per observation (index = KEY = [customer, obs_id]).
+    collisions: only for KEY_MODE='cif_m0' (see COLLISIONS).
     Memory-safe: transactions are processed in batches of whole customers.
     log_money: also add <col>_slog for money totals (sign(x) * log(1 + |x|)).
     """
@@ -516,6 +530,39 @@ def build_features(clients, txns, batch_customers=20_000, log_money=True, verbos
         for c in money:
             feats[c + "_slog"] = signed_log1p(feats[c])
     return feats
+
+
+# ======================================================================================================
+# Static (point-in-time) account fields: the baseline the time-aware features are compared against
+# ======================================================================================================
+SEGMENT_COLS = ["m0_start_cd_group", "product_group", "new_to_arrears_flag"]   # use to stratify results and models
+
+
+def static_fields(clients, collisions=None):
+    """
+    Point-in-time account fields known at M0, one row per observation (index = KEY), all numeric:
+      arrears_share_of_due, crccreditlimit_slog, m0_arrearsamount_slog,
+      cd_stage (CD1 = 1-29 days behind, CD2 = 30-59 ...; number parsed from m0_start_cd_group) + one-hot of the group,
+      new_to_arrears_flag (1 = not observed the previous month), obs_in_month_for_cif (several accounts / statement
+      dates in the month), one-hot product_group (NPDM lower risk, PDM medium, ACC high risk / low limit).
+    Never includes outcome columns (payment_count, total_paid, target_rule, target_value).
+    """
+    c = resolve_observations(clients, collisions, verbose=False).set_index(KEY)
+    out = pd.DataFrame(index=c.index)
+    for col in ("arrears_share_of_due", "crccreditlimit_slog", "m0_arrearsamount_slog", "new_to_arrears_flag",
+                # "obs_in_month_for_cif" not in dataset yet
+                ):
+        if col in c:
+            out[col] = pd.to_numeric(c[col], errors="coerce").astype("float64")
+    if "m0_start_cd_group" in c:
+        g = c["m0_start_cd_group"].astype(str)
+        num = pd.to_numeric(g.str.extract(r"(\d+)")[0], errors="coerce")
+        if num.notna().any():
+            out["cd_stage"] = num.astype("float64")
+        out = out.join(pd.get_dummies(g, prefix="cd", dtype="float64"))
+    if "product_group" in c:
+        out = out.join(pd.get_dummies(c["product_group"].astype(str), prefix="product", dtype="float64"))
+    return out
 
 
 # ======================================================================================================
