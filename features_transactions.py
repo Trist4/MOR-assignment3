@@ -50,8 +50,8 @@ TXN_TYPE, AMT, BAL, SPEND, CAT = "trantypedesc", "amount", "balance", "spendgrou
 # ======================================================================================================
 # CONFIG
 # ======================================================================================================
-MONTH_LEN = 30                  # days per "month" block
-N_MONTHS = 3                    # number of blocks (the extract holds ~98 days, so 3 x 30 is safe)
+MONTH_LEN = 31                  # days per "month" block
+N_MONTHS = 3                    # number of blocks (the extract holds ~98 days, so 3 x 31 is safe)
 AGE_COL = "days_before_m0"      # days from the transaction to the reference date (>= 0 = before it)
 
 # tx_period looks like a pre / post flag. TODO: confirm what 'post' means. Rows after the payment date may already
