@@ -208,7 +208,9 @@ def build_clients(get, key, client_cols, report, check_conflicts=False):
 def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_customers, report,
                        id_as_category=True, verbose=True):
     """Exact duplicates are removed WITHIN an observation (key + all transaction columns). Batched by customer."""
-    tcols = key + txn_cols
+    # ID is needed for customer-batched filtering even when the observation key is only [OBS].
+    # Keep it in the transaction table, but do not add it to dedupe_cols unless it is part of `key`.
+    tcols = list(dict.fromkeys(key + [ID] + txn_cols))
     dedupe_cols = key + [c for c in txn_cols if c not in dedupe_exclude]
     t = get(tcols)
     report["txn_raw_rows"] = t.num_rows
