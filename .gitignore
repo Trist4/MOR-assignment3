@@ -1,3 +1,4 @@
 snapshot/
 *.parquet
 .venv/
+.DS_Store
