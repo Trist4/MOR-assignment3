@@ -1,7 +1,7 @@
 """
 features_transactions.py - RUNNING-STATE feature engineering (an alternative to the monthly blocks in features.py).
 
-Instead of cutting the window into 30-day months, every observation's transactions are replayed in time order and
+Every observation's transactions are replayed in time order and
 a running state is kept: "how much has come in / gone out so far", "what is my balance now", "how long since I was
 last paid". The state after the last transaction is the CURRENT state at M0 (or at any earlier cut-off: as_of).
 
@@ -12,7 +12,7 @@ last paid". The state after the last transaction is the CURRENT state at M0 (or 
 
     state = build_running_features(clients, txns)                         # 1 row per observation: state at M0
     snaps = build_running_snapshots(clients, txns, as_of=(60, 30, 0))     # state at 60, 30 and 0 days before M0
-    for tbl in running_table(clients, txns):                              # 1 row per transaction (sequence format)
+    for tbl in running_table(clients, txns):                              # 1 row per (obs_id, transactiondate)
         ...                                                               # (batched generator: memory safe)
 
 Three outputs, three uses
@@ -20,8 +20,10 @@ Three outputs, three uses
                            trees, exactly like the monthly features.
   build_running_snapshots  the same state at several cut-offs, stacked long (extra index level as_of_days). Gives
                            time-awareness (state then vs now) without monthly buckets, and extra training rows.
-  running_table            one row per transaction with the running state AFTER that transaction. Use for sequence
-                           models, plots of a customer's trajectory, or to build your own windows.
+  running_table            one row per (obs_id, transactiondate): the running state at the END of that day. Use for
+                           sequence models, plots of an observation's trajectory, or to build your own windows.
+                           (obs_id, transactiondate) is unique; the table has no transaction id, and the order of
+                           transactions inside one day is not known, so a day is the finest honest grain.
 
 Category groups, masks, and configuration are defined locally in this module, independently of features_monthly.py. Window: the last WINDOW_DAYS days before M0, 'pre' rows only (no outcome leakage).
 
@@ -46,6 +48,7 @@ import pandas as pd
 ID, OBS, M0 = "cifwithcheckdigit", "obs_id", "m0_monthenddate"
 KEY = [OBS]
 TXN_TYPE, AMT, BAL, SPEND, CAT = "trantypedesc", "amount", "balance", "spendgroup", "categoryname"
+DATE = "transactiondate"        # with obs_id this identifies one row of the running table (one obs_id-day)
 
 # ======================================================================================================
 # CONFIG
@@ -329,14 +332,76 @@ def _running(sub, gid, by_group=True):
     max_age = pd.Series(age).groupby(gid).transform("max").to_numpy()
 
     out = pd.DataFrame({ID: sub[ID].to_numpy(), OBS: sub[OBS].to_numpy(), AGE_COL: age})
-    if "transactiondate" in sub:
-        out["transactiondate"] = sub["transactiondate"].to_numpy()
+    if DATE in sub:
+        out[DATE] = sub[DATE].to_numpy()
     out = pd.concat([out, cum], axis=1)
     out["days_since_last_income"] = last_inc - age
     out["days_since_last_uif"] = last_uif - age
     out["days_covered"] = max_age - age + 1
     hidden = pd.DataFrame({"_last_income_age": last_inc, "_last_uif_age": last_uif, "_max_age": max_age})
     return out, hidden
+
+
+# ======================================================================================================
+# Daily grain: one row per (obs_id, transactiondate)
+# ======================================================================================================
+def _day_key(sub):
+    """The calendar day of every row (time of day dropped)."""
+    if DATE not in sub:
+        raise KeyError(f"'{DATE}' missing: the running table is keyed by (obs_id, {DATE})")
+    return pd.to_datetime(sub[DATE]).dt.normalize().to_numpy()
+
+
+def _daily(tbl, gid, sub):
+    """
+    Collapse the per-transaction running table to one row per (obs_id, transactiondate): the state AFTER the last
+    transaction of the day. Totals, counts and recency are order-independent inside a day. `balance` is the balance
+    of the last row of the day in file order (the true time of day is not in the data; see check_daily_balance).
+    Adds n_txn_day (transactions on that day).
+    """
+    day = _day_key(sub)
+    n = len(gid)
+    last = np.ones(n, dtype=bool)
+    if n > 1:
+        last[:-1] = (gid[1:] != gid[:-1]) | (day[1:] != day[:-1])
+    d = tbl.loc[last].reset_index(drop=True)
+    d["n_txn_day"] = d["run_n_txn"].groupby(gid[last]).diff().fillna(d["run_n_txn"]).astype("int32")
+    d[DATE] = day[last]
+    front = [OBS, DATE, AGE_COL]
+    d = d[front + [c for c in d.columns if c not in front]]
+    if d.duplicated([OBS, DATE]).any():
+        raise ValueError(f"({OBS}, {DATE}) is not unique: {AGE_COL} and {DATE} disagree about which day a row is on")
+    return d
+
+
+def check_daily_balance(txns, tol=0.01, pre_only=True):
+    """
+    Is the file order inside a day the real order? If `balance` is the balance after each transaction, then
+        closing balance of a day - closing balance of the previous day == sum of that day's amounts
+    holds when the LAST row of the day carries the closing balance. Reported separately for days with one
+    transaction and days with several. Near 100% for both = balance is a running balance and the file order inside a
+    day is the real order, so the end-of-day balance in running_table is sound. A low share for the multi-transaction
+    days (which also drags down the single days that follow them) = the order inside a day is not the real order:
+    treat `balance` as approximate; the totals, counts and recency columns are unaffected.
+    """
+    d = txns
+    if pre_only and PRE_COL and PRE_COL in d:
+        d = d.loc[_isin(d, PRE_COL, [PRE_VALUE])]
+    d = d[[OBS, DATE, AMT, BAL]].copy()
+    d[DATE] = pd.to_datetime(d[DATE]).dt.normalize()
+    d[OBS] = d[OBS].astype(str)
+    day = d.sort_values([OBS, DATE], kind="stable").groupby([OBS, DATE], sort=False).agg(
+        closing=(BAL, "last"), total=(AMT, "sum"), n=(AMT, "size"))
+    prev = day.groupby(level=0)["closing"].shift()
+    ok = ((day["closing"] - prev - day["total"]).abs() <= tol)[prev.notna()]
+    multi = (day["n"] > 1)[prev.notna()]
+    out = pd.DataFrame({"days": [int((~multi).sum()), int(multi.sum())],
+                        "consistent": [float(ok[~multi].mean()) if (~multi).any() else np.nan,
+                                       float(ok[multi].mean()) if multi.any() else np.nan]},
+                       index=["one transaction", "several transactions"])
+    print("Day-to-day balance check (closing - previous closing == sum of amounts):")
+    print(out.assign(consistent=out["consistent"].map("{:.1%}".format)).to_string())
+    return out
 
 
 # ======================================================================================================
@@ -454,9 +519,10 @@ def build_running_snapshots(clients, txns, as_of=(60, 30, 0), **kw):
 
 def running_table(clients, txns, batch_customers=20_000, by_group=True, as_of=0, verbose=True, collisions=None):
     """
-    GENERATOR of per-transaction running tables (one DataFrame per batch of whole customers).
-    Columns: customer, obs_id, days_before_m0, [transactiondate], run_* (state after this transaction), balance,
-    run_min/max_balance, days_since_last_income / uif (as at that transaction), days_covered.
+    GENERATOR of daily running tables (one DataFrame per batch of whole customers).
+    One row per (obs_id, transactiondate), unique. Columns: obs_id, transactiondate, days_before_m0, customer,
+    n_txn_day, run_* (state at the END of the day), balance (last row of the day), run_min/max_balance,
+    days_since_last_income / uif (as at the end of the day), days_covered.
     """
     _validate_config()
     clients, _ = _prep_clients(clients, collisions, verbose)
@@ -466,7 +532,7 @@ def running_table(clients, txns, batch_customers=20_000, by_group=True, as_of=0,
             print(f"  running table batch {b + 1}/{nb}: {len(sub):,} rows")
         if len(sub):
             tbl, _ = _running(sub, gid, by_group)
-            yield tbl
+            yield _daily(tbl, gid, sub)
 
 
 if __name__ == "__main__":
@@ -474,7 +540,7 @@ if __name__ == "__main__":
     ap.add_argument("--path", default="snapshot/snapshot.parquet")
     ap.add_argument("--out", default="features_running.parquet")
     ap.add_argument("--as-of", type=int, nargs="+", default=[0], help="cut-offs in days before M0, e.g. 60 30 0")
-    ap.add_argument("--table-dir", default=None, help="also write the per-transaction running tables here (parquet parts)")
+    ap.add_argument("--table-dir", default=None, help="also write the daily (obs_id, transactiondate) running tables here (parquet parts)")
     ap.add_argument("--batch-customers", type=int, default=20_000)
     ap.add_argument("--no-groups", action="store_true")
     args, _ = ap.parse_known_args()
@@ -489,4 +555,4 @@ if __name__ == "__main__":
         os.makedirs(args.table_dir, exist_ok=True)
         for i, t in enumerate(running_table(clients, txns, **kw)):
             t.to_parquet(os.path.join(args.table_dir, f"part_{i:04d}.parquet"), index=False)
-        print(f"Per-transaction running tables written to {args.table_dir}/")
+        print(f"Daily running tables written to {args.table_dir}/")
