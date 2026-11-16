@@ -1,7 +1,7 @@
 """
 features_transactions.py - RUNNING-STATE feature engineering (an alternative to the monthly blocks in features.py).
 
-Every observation's transactions are replayed in time order and
+Instead of cutting the window into 30-day months, every observation's transactions are replayed in time order and
 a running state is kept: "how much has come in / gone out so far", "what is my balance now", "how long since I was
 last paid". The state after the last transaction is the CURRENT state at M0 (or at any earlier cut-off: as_of).
 
@@ -279,7 +279,6 @@ def _window(txns, as_of, chosen):
     if DROP_SPENDGROUPS:
         keep &= ~_isin(txns, SPEND, DROP_SPENDGROUPS)
     sub = txns.loc[keep].copy()
-    sub[ID] = sub[ID].astype(str)
     sub["age"] = age[keep]
     sub = attach_key(sub, chosen)          # retain only known obs_id values
     gid = pd.factorize(sub[OBS])[0]
@@ -331,7 +330,7 @@ def _running(sub, gid, by_group=True):
     last_uif = pd.Series(np.where(M["uif"], age, np.nan)).groupby(gid).ffill().to_numpy()
     max_age = pd.Series(age).groupby(gid).transform("max").to_numpy()
 
-    out = pd.DataFrame({ID: sub[ID].to_numpy(), OBS: sub[OBS].to_numpy(), AGE_COL: age})
+    out = pd.DataFrame({OBS: sub[OBS].to_numpy(), AGE_COL: age})
     if DATE in sub:
         out[DATE] = sub[DATE].to_numpy()
     out = pd.concat([out, cum], axis=1)
@@ -457,8 +456,10 @@ def add_state_ratios(s):
 # Assembly (batched over whole customers)
 # ======================================================================================================
 def _batches(clients, txns, batch_customers):
-    codes = pd.factorize(txns[ID])[0]
-    n_batches = max(1, int(np.ceil(clients[ID].nunique() / batch_customers)))
+    # txns are keyed by obs_id only (no customer id column); every feature is per observation, so batch on obs_id.
+    # `batch_customers` is kept as the argument name: it is the approximate number of observations per batch.
+    codes = pd.factorize(txns[OBS])[0]
+    n_batches = max(1, int(np.ceil(clients[OBS].nunique() / batch_customers)))
     bid = codes % n_batches
     order = np.argsort(bid, kind="stable")
     bounds = np.searchsorted(bid[order], np.arange(n_batches + 1))
@@ -526,13 +527,16 @@ def running_table(clients, txns, batch_customers=20_000, by_group=True, as_of=0,
     """
     _validate_config()
     clients, _ = _prep_clients(clients, collisions, verbose)
+    cust = clients.set_index(OBS)[ID]
     for b, nb, chunk in _batches(clients, txns, batch_customers):
         sub, gid = _window(chunk, as_of, clients)
         if verbose:
             print(f"  running table batch {b + 1}/{nb}: {len(sub):,} rows")
         if len(sub):
             tbl, _ = _running(sub, gid, by_group)
-            yield _daily(tbl, gid, sub)
+            d = _daily(tbl, gid, sub)
+            d.insert(1, "customer", d[OBS].map(cust).to_numpy())
+            yield d
 
 
 if __name__ == "__main__":

@@ -1,13 +1,17 @@
 """
-clean_data.py (v2, observation-aware) - read the collections data and return two cleaned tables.
+clean_data.py (v3, obs_id only) - read the collections data and return two cleaned tables.
 
-    clients : one row per OBSERVATION (obs_id) - arrears / account information + log features
-    txns    : one row per distinct transaction WITHIN an observation - plus log features and days_before_m0
+    clients : one row per OBSERVATION (obs_id = one account at one month) - arrears / account information + log
+              features. cifwithcheckdigit is kept here as a plain column (only for grouped train/test splits).
+    txns    : one row per distinct transaction WITHIN an observation, keyed by obs_id only (no customer id),
+              plus log features and days_before_m0
 
-Why "observation"? The extract now carries obs_id / obs_seq, so one customer can appear in several observation
-windows, and the same transaction can legitimately appear in more than one of them (overlapping windows).
-Duplicates are therefore only removed WITHIN an observation, never across observations. If the file has no
-obs_id the key falls back to (customer, M0) for legacy extracts.
+The unit of analysis is the obs_id. Transactions are grouped on obs_id alone; the customer id is never part of the
+key. Duplicates are removed WITHIN an observation only (the same transaction can legitimately sit under several
+obs_ids). If the file has no obs_id the key falls back to (customer, M0).
+
+Optional window: pass window_days=30 to keep only transactions 0 to 29 days before M0 (a single month), which
+also cuts memory by about two thirds on the full file.
 
 Which columns belong to which table is INFERRED from the data: a column that is constant within every sampled
 observation is observation-level (-> clients); one that varies is transaction-level (-> txns). New columns such as
@@ -53,20 +57,17 @@ DATE_COLS = [M0, PAY_DATE, TXN_DATE]
 # Describe the outcome period / label (after M0). Fine for analysis, never model inputs.
 OUTCOME_COLS = ["payment_count", "total_paid", TARGET, "target_rule"]
 
-CSV_DTYPES = {ID: "string", "m0_arrearsamount": "float32", "due_count": "uint8", "payment_count": "uint8",
+CSV_DTYPES = {ID: "string", OBS: "string", "m0_arrearsamount": "float32", "due_count": "uint8", "payment_count": "uint8",
               "m0_total_due_with_arrears": "float32", "total_paid": "float32", TARGET: "int8",
               METHOD: "category", TXN_TYPE: "category", AMT: "float32", BAL: "float32",
               SPEND: "category", CAT: "category"}
 
 
 # ----------------------------------------------------------------------------------------------
-"""
-PUT INTO SEPARATE FEATURE ENGINEERING FILE
 def signed_log1p(x):
-    sign(x) * log(1 + |x|): compresses heavy tails and is defined for zero and negative values.
-    For non-negative values it equals log1p(x).
+    """sign(x) * log(1 + |x|): compresses heavy tails and is defined for zero and negative values.
+    For non-negative values it equals log1p(x)."""
     return np.sign(x) * np.log1p(np.abs(x))
-"""
 
 
 def _to_datetime(s):
@@ -86,7 +87,7 @@ def _value_type(t):
 
 
 def _ids_array(ids, typ):
-    """Customer ids as an arrow array of the column's own type (ids may be strings or integers in the file)."""
+    """Ids as an arrow array of the column's own type (ids may be strings or integers in the file)."""
     typ = _value_type(typ)
     vals = [int(i) for i in ids] if pa.types.is_integer(typ) else [str(i) for i in ids]
     return pa.array(vals, type=typ)
@@ -111,34 +112,51 @@ def _group_first_row(t, key):
 
 
 # ----------------------------------------------------------------------------------------------
+def fix_dictionaries(tbl):
+    """Older pyarrow cannot convert dictionary columns with unsigned indices to pandas: recast to int32 indices."""
+    for i, f in enumerate(tbl.schema):
+        t = f.type
+        if pa.types.is_dictionary(t) and pa.types.is_unsigned_integer(t.index_type):
+            col = tbl.column(i)
+            try:
+                new = col.cast(pa.dictionary(pa.int32(), t.value_type))
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                new = col.cast(t.value_type)
+            tbl = tbl.set_column(i, f.name, new)
+    return tbl
+
+
 def _open(path):
-    """Return (column_names, get) where get(cols, ids=None) -> pyarrow.Table (optionally only some customers)."""
+    """Return (column_names, get) where get(cols, ids=None, id_col=None) -> pyarrow.Table (optionally only rows whose
+    `id_col` is in `ids`)."""
     if path.lower().endswith(".parquet"):
         dataset = ds.dataset(path)
         names = dataset.schema.names
-        vt = _value_type(dataset.schema.field(ID).type)
 
-        def get(cols, ids=None):
-            flt = ds.field(ID).isin(_ids_array(ids, vt)) if ids is not None else None
-            return dataset.to_table(columns=cols, filter=flt)
+        def get(cols, ids=None, id_col=None):
+            flt = (ds.field(id_col).isin(_ids_array(ids, _value_type(dataset.schema.field(id_col).type)))
+                   if ids is not None else None)
+            return fix_dictionaries(dataset.to_table(columns=cols, filter=flt))
         return names, get
 
     hdr = pd.read_csv(path, nrows=0).columns.tolist()
     df = pd.read_csv(path, dtype={k: v for k, v in CSV_DTYPES.items() if k in hdr},
                      parse_dates=[c for c in DATE_COLS if c in hdr])
-    df[ID] = df[ID].astype(str)
+    for c in (ID, OBS):
+        if c in df:
+            df[c] = df[c].astype(str)
     tbl = pa.Table.from_pandas(df, preserve_index=False)
     del df
 
-    def get(cols, ids=None):
+    def get(cols, ids=None, id_col=None):
         t = tbl.select(cols)
         if ids is not None:
-            t = t.filter(pc.is_in(t[ID], value_set=_ids_array(ids, t[ID].type)))
+            t = t.filter(pc.is_in(t[id_col], value_set=_ids_array(ids, t[id_col].type)))
         return t
     return hdr, get
 
 
-def infer_levels(names, get, key, n_customers=2000, seed=0):
+def infer_levels(names, get, key, n_obs=4000, seed=0):
     """
     Split non-key columns into observation-level (constant within every sampled observation) and
     transaction-level (varies within an observation). Also flags integer row counters (consecutive 0..n or 1..n
@@ -146,12 +164,13 @@ def infer_levels(names, get, key, n_customers=2000, seed=0):
     rows are duplicates, otherwise no duplicate could ever match.
     """
     others = [c for c in names if c not in key]
-    ids_tbl = get([ID])
-    ids = pd.Series(_decode(pc.unique(ids_tbl[ID])).to_pylist())
+    K = key[0]
+    ids_tbl = get([K])
+    ids = pd.Series(_decode(pc.unique(ids_tbl[K])).to_pylist())
     del ids_tbl
-    sample = ids.sample(min(n_customers, len(ids)), random_state=seed).tolist()
-    sub = get(key + others, ids=sample).to_pandas()
-    sub[ID] = sub[ID].astype(str)
+    sample = ids.sample(min(n_obs, len(ids)), random_state=seed).tolist()
+    sub = get(key + others, ids=sample, id_col=K).to_pandas()
+    sub[K] = sub[K].astype(str)
     g = sub.groupby(key, observed=True, dropna=False)
     varies = {c: bool((g[c].nunique(dropna=False) > 1).any()) for c in others}
     client_cols = [c for c in others if not varies[c]]
@@ -186,17 +205,17 @@ def build_clients(get, key, client_cols, report, check_conflicts=False):
         report["clients_with_conflicting_records"] = distinct.num_rows - len(clients)
     del t
 
-    clients[ID] = clients[ID].astype(str)
+    for c in dict.fromkeys(key + [ID]):                 # key columns and the (optional) customer id as plain text
+        if c in clients:
+            clients[c] = clients[c].astype(str)
     for c in (M0, PAY_DATE):
         if c in clients:
             clients[c] = _to_datetime(clients[c])
     clients = clients.sort_values(key).reset_index(drop=True)
 
-    """
     for c in MONEY_CLIENT:
         if c in clients:
             clients[f"{c}_slog"] = signed_log1p(clients[c].astype("float32")).astype("float32")
-    """
     if {"m0_arrearsamount", "m0_total_due_with_arrears"} <= set(clients.columns):
         clients["arrears_share_of_due"] = (clients["m0_arrearsamount"] /
                                            clients["m0_total_due_with_arrears"].replace(0, np.nan)).astype("float32")
@@ -205,12 +224,11 @@ def build_clients(get, key, client_cols, report, check_conflicts=False):
     return clients
 
 
-def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_customers, report,
-                       id_as_category=True, verbose=True):
-    """Exact duplicates are removed WITHIN an observation (key + all transaction columns). Batched by customer."""
-    # ID is needed for customer-batched filtering even when the observation key is only [OBS].
-    # Keep it in the transaction table, but do not add it to dedupe_cols unless it is part of `key`.
-    tcols = list(dict.fromkeys(key + [ID] + txn_cols))
+def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_obs, report,
+                       id_as_category=True, verbose=True, window_days=None):
+    """Exact duplicates are removed WITHIN an observation (key + all transaction columns). Batched by obs_id."""
+    K = key[0]                                                       # obs_id (or the customer in the no-obs_id fallback)
+    tcols = key + txn_cols
     dedupe_cols = key + [c for c in txn_cols if c not in dedupe_exclude]
     t = get(tcols)
     report["txn_raw_rows"] = t.num_rows
@@ -222,22 +240,22 @@ def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_custom
             values = _categories(t[c])
             if len(values) <= 5000:                                  # skip high-cardinality text
                 cats[c] = pd.CategoricalDtype(values)
-    id_dtype = pd.CategoricalDtype(clients[ID].drop_duplicates().tolist())
+    id_dtype = pd.CategoricalDtype(clients[K].drop_duplicates().tolist())
 
     m0_in_key = M0 in key
     m0_map = clients[key + [M0]] if (M0 in clients and not m0_in_key) else None
-    check_cols = [c for c in (ID, TXN_DATE, AMT) if c in tcols]
-    ids_all = clients[ID].drop_duplicates().to_numpy()               # clients is sorted by customer id
+    check_cols = [c for c in (K, TXN_DATE, AMT) if c in tcols]
+    ids_all = clients[K].drop_duplicates().to_numpy()                # clients is sorted by key
 
-    parts, n_matched, n_null, n_dup, n_no_obs = [], 0, 0, 0, 0
-    n_batches = int(np.ceil(len(ids_all) / batch_customers))
+    parts, n_matched, n_null, n_dup, n_no_obs, n_outside = [], 0, 0, 0, 0, 0
+    n_batches = int(np.ceil(len(ids_all) / batch_obs))
     t0 = time.time()
     for b in range(n_batches):
-        batch_ids = ids_all[b * batch_customers:(b + 1) * batch_customers]
-        col = _decode(t[ID])
+        batch_ids = ids_all[b * batch_obs:(b + 1) * batch_obs]
+        col = _decode(t[K])
         mask = pc.is_in(col, value_set=_ids_array(batch_ids, col.type))
         sub = t.filter(mask).to_pandas()
-        sub[ID] = sub[ID].astype(str)
+        sub[K] = sub[K].astype(str)
         if TXN_DATE in sub:
             sub[TXN_DATE] = _to_datetime(sub[TXN_DATE])
         n_matched += len(sub)
@@ -250,11 +268,9 @@ def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_custom
         sub = sub.drop_duplicates(subset=dedupe_cols)                # key is included => within an observation only
         n_dup += n0 - len(sub)
 
-        """
         for c in MONEY_TXN:
             if c in sub:
                 sub[f"{c}_slog"] = signed_log1p(sub[c].astype("float32")).astype("float32")
-        """
         if m0_in_key and TXN_DATE in sub:                              # no obs_id: M0 is part of the key
             sub[M0] = _to_datetime(sub[M0])
             sub["days_before_m0"] = (sub[M0] - sub[TXN_DATE]).dt.days.astype("Int16")
@@ -263,10 +279,14 @@ def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_custom
             n_no_obs += int(sub[M0].isna().sum())
             sub["days_before_m0"] = (sub[M0] - sub[TXN_DATE]).dt.days.astype("Int16")
             sub = sub.drop(columns=[M0])
+        if window_days is not None and "days_before_m0" in sub:      # keep one window only (0 = M0 day)
+            n0 = len(sub)
+            sub = sub[(sub["days_before_m0"] >= 0) & (sub["days_before_m0"] < window_days)]
+            n_outside += n0 - len(sub)
         for c, dt in cats.items():
             sub[c] = sub[c].astype(dt)
         if id_as_category:
-            sub[ID] = sub[ID].astype(id_dtype)
+            sub[K] = sub[K].astype(id_dtype)
         sort_cols = key + ([TXN_DATE] if TXN_DATE in sub else [])
         parts.append(sub.sort_values(sort_cols).reset_index(drop=True))
         if verbose:
@@ -277,23 +297,25 @@ def build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_custom
     report["txn_rows_without_client"] = report["txn_raw_rows"] - n_matched
     report["txn_rows_unmatched_observation"] = n_no_obs
     report["txn_rows_dropped_missing_key_fields"] = n_null
+    report["txn_rows_outside_window"] = n_outside
     report["txn_exact_duplicates_removed"] = n_dup
     report["txn_after"] = len(txns)
     return txns
 
 
-def load_and_clean(path, batch_customers=10_000, id_as_category=True, verbose=True,
+def load_and_clean(path, batch_obs=20_000, id_as_category=True, verbose=True,
                    infer_levels_=True, client_cols=None, txn_cols=None, dedupe_exclude=None,
-                   check_conflicts=False):
+                   check_conflicts=False, window_days=None):
     """
     Read `path` (.parquet or .csv) and return (clients, txns, report).
 
-    clients: one row per observation (obs_id). Raw columns, `<money>_slog` log features,
+    clients: one row per observation (obs_id). Raw columns (incl. the customer id as a plain column), `<money>_slog` log features,
              arrears_share_of_due, days_payment_before_m0.
-    txns:    one row per distinct transaction within an observation. Raw columns, amount_slog, balance_slog,
+    txns:    one row per distinct transaction within an observation, keyed by obs_id. Raw columns, amount_slog, balance_slog,
              days_before_m0. Exact duplicates are removed within each observation only.
     report:  dict of row counts and what was removed; report["levels"] holds the column split that was used.
 
+    window_days: keep only transactions 0 <= days_before_m0 < window_days (e.g. 30 = a single month). Default: all.
     dedupe_exclude: transaction-level columns ignored when deciding if two rows are duplicates (default: detected
                     integer row counters such as a per-observation sequence number).
     """
@@ -325,14 +347,15 @@ def load_and_clean(path, batch_customers=10_000, id_as_category=True, verbose=Tr
         print(f"Ignored when matching duplicates (row counters): {list(dedupe_exclude)}\nBuilding clients table ...")
 
     clients = build_clients(get, key, client_cols, report, check_conflicts)
-    report["customers"] = clients[ID].nunique()
-    report["max_observations_per_customer"] = int(clients.groupby(ID).size().max())
+    if ID in clients:
+        report["customers"] = clients[ID].nunique()
+        report["max_observations_per_customer"] = int(clients.groupby(ID).size().max())
     if verbose:
         print(f"  {report['clients_raw_rows']:,} raw rows -> {report['clients_after']:,} observations "
-              f"({report['customers']:,} customers) ({time.time() - t0:,.0f}s)\nBuilding transactions table ...")
+              f"({time.time() - t0:,.0f}s)\nBuilding transactions table ...")
 
-    txns = build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_customers, report,
-                              id_as_category, verbose)
+    txns = build_transactions(get, key, txn_cols, dedupe_exclude, clients, batch_obs, report,
+                              id_as_category, verbose, window_days)
     report["clients_without_transactions"] = len(clients) - txns.groupby(key, observed=True).ngroups
 
     for name, df in (("clients", clients), ("transactions", txns)):     # reported, never dropped automatically
@@ -349,19 +372,21 @@ def print_report(r):
         ("CLIENTS (one row per observation)", ""),
         ("  raw rows (observation fields repeated per transaction)", f"{r['clients_raw_rows']:,}"),
         ("  observations after cleaning", f"{r['clients_after']:,}"),
-        ("  distinct customers", f"{r['customers']:,}"),
-        ("  max observations per customer", f"{r['max_observations_per_customer']:,}"),
     ]
+    if "customers" in r:
+        rows += [("  distinct customers (plain column, not a key)", f"{r['customers']:,}"),
+                 ("  max observations per customer", f"{r['max_observations_per_customer']:,}")]
     if "clients_with_conflicting_records" in r:
         rows.append(("  observations with conflicting records (kept first)", f"{r['clients_with_conflicting_records']:,}"))
     rows += [
         ("TRANSACTIONS", ""),
         ("  raw rows", f"{r['txn_raw_rows']:,}"),
-        ("  rows with no matching client", f"{r['txn_rows_without_client']:,}"),
+        ("  rows with no matching observation id", f"{r['txn_rows_without_client']:,}"),
         ("  rows with no matching observation", f"{r['txn_rows_unmatched_observation']:,}"),
         ("  dropped (missing id / date / amount)", f"{r['txn_rows_dropped_missing_key_fields']:,}"),
         ("  exact duplicates removed (within observation)", f"{r['txn_exact_duplicates_removed']:,} "
                                       f"({r['txn_exact_duplicates_removed'] / max(r['txn_raw_rows'], 1):.2%} of raw)"),
+        ("  outside the window (window_days)", f"{r['txn_rows_outside_window']:,}"),
         ("  transactions after cleaning", f"{r['txn_after']:,}"),
         ("CHECKS", ""),
         ("  observations without any transaction", f"{r['clients_without_transactions']:,}"),
@@ -382,11 +407,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", default="collections_data.parquet", help="source file (.parquet or .csv)")
     ap.add_argument("--out-dir", default="cleaned")
-    ap.add_argument("--batch-customers", type=int, default=10_000, help="lower this if memory is tight")
+    ap.add_argument("--batch-obs", type=int, default=20_000, help="observations per batch; lower this if memory is tight")
+    ap.add_argument("--window-days", type=int, default=None, help="keep only transactions 0..N-1 days before M0 (e.g. 30)")
     ap.add_argument("--plain-ids", action="store_true", help="keep customer ids as plain strings instead of category")
     ap.add_argument("--no-infer", action="store_true", help="use the default column split instead of inferring it")
     ap.add_argument("--check-conflicts", action="store_true", help="verify observation-level columns are constant (slower)")
     args, _ = ap.parse_known_args()
-    c, t, _ = load_and_clean(args.path, args.batch_customers, id_as_category=not args.plain_ids,
-                             infer_levels_=not args.no_infer, check_conflicts=args.check_conflicts)
+    c, t, _ = load_and_clean(args.path, args.batch_obs, id_as_category=not args.plain_ids,
+                             infer_levels_=not args.no_infer, check_conflicts=args.check_conflicts,
+                             window_days=args.window_days)
     save(c, t, args.out_dir)

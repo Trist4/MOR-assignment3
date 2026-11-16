@@ -1,0 +1,7 @@
+,train,validation,test,target_value,share_train
+2 last balance < 250,458,145,81,0,0.014
+4 received <= 0,9107,2241,2228,1,0.272
+5 received < due,7381,1807,1927,1,0.22
+6 received >= due,15677,3892,3966,0,0.468
+7 arrears up at window end,879,210,225,1,0.026
+rare_1 (merged: 8),21,5,3,1,0.001
