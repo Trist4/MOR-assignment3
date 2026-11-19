@@ -1,0 +1,3 @@
+candidate,components,covariance_type,bic,n_clusters,gini_macro,gini_weighted
+6-spherical,6,spherical,1055786.4160792453,6,0.28693997451113257,0.3553027438189345
+6-full,6,full,30779.928067226272,6,0.18545532675186094,0.2586350326079124
